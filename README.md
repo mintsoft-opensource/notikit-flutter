@@ -2,6 +2,8 @@
 
 > Notikit Flutter SDK — 유저 중심 푸시 디바이스 등록/식별.
 
+[소개](https://notikit.mint-soft.com) · [서버](https://github.com/mintsoft-opensource/notikit) · 다른 SDK: [JS](https://github.com/mintsoft-opensource/notikit-js) · [iOS](https://github.com/mintsoft-opensource/notikit-ios) · [Android](https://github.com/mintsoft-opensource/notikit-android)
+
 ## 설치
 ```yaml
 dependencies:
