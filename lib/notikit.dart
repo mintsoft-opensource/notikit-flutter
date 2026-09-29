@@ -4,6 +4,7 @@
 library notikit;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
@@ -135,6 +136,17 @@ class Notikit {
   /// 새 토큰으로 registerDevice 를 부르면 **행이 하나 더 생긴다** — 옛 행이 유저
   /// 바인딩을 유지한 채 활성으로 남아 같은 사람에게 중복 발송된다. 서버가 기존 행의
   /// 토큰을 제자리 갱신하게 해 기기 id·토픽 구독·클릭 이력을 보존한다.
+  ///
+  /// 서버는 교체하지 못해도(모르는 옛 토큰·identity 증명 실패·충돌) 202 `{rotated: false}` 로
+  /// 답한다. 그때 새 토큰은 어디에도 등록되지 않았으므로 **[registerDevice] 로 직접 등록**해야
+  /// 이 기기로 발송이 이어진다:
+  ///
+  /// ```dart
+  /// final r = await notikit.rotateToken(oldToken: old, newToken: fresh, identityHash: hash);
+  /// if (r['rotated'] != true) {
+  ///   await notikit.registerDevice(token: fresh, platform: platform, userId: userId, identityHash: hash);
+  /// }
+  /// ```
   Future<Map<String, dynamic>> rotateToken({
     required String oldToken,
     required String newToken,
@@ -178,6 +190,39 @@ class Notikit {
       'token': token,
       'destination': destination,
     });
+  }
+
+  /// 수신 보고 중복 방지 — 이미 보고한 발송 id. 삽입 순서를 지켜 오래된 것부터 버린다.
+  ///
+  /// FCM·APNs 는 같은 메시지를 다시 배달할 수 있다. 서버가 (발송, 기기) 유니크로 한 번만
+  /// 세지만, 기억하지 않으면 재배달마다 요청이 한 번씩 더 나가 수신 보고 rate limit 을
+  /// 깎아먹는다. 프로세스 안에서만 유효한 기억이다 — 놓친 중복은 낭비된 요청 한 건으로 끝난다.
+  final LinkedHashSet<String> _receivedLogIds = LinkedHashSet<String>();
+
+  /// 한 프로세스가 기억하는 수신 보고 발송 id 수
+  static const int receiptDedupeSize = 200;
+
+  /// 푸시 **수신** 보고 — 단말이 실제로 알림을 받았다는 사실을 남긴다.
+  ///
+  /// FCM 접수(발송 성공)는 기기가 꺼져 있어도 성공한다. 앱이 이걸 부르지 않으면 콘솔의
+  /// "도달" 칸은 영원히 0 이다. 부르는 자리는 **알림을 받은 순간** —
+  /// `FirebaseMessaging.onMessage`(포그라운드)와 `onBackgroundMessage`(백그라운드) 핸들러다.
+  ///
+  /// 같은 발송을 두 번 이상 부르면 요청을 내보내지 않고 `null` 을 돌려준다.
+  /// 보고했으면 서버가 새로 기록했는지(`recorded`)를 돌려준다.
+  Future<bool?> reportReceived({required String logId, required String token}) async {
+    // 보고 **전에** 잡아 둔다 — 두 번째 배달이 첫 요청의 응답을 기다리는 사이에 끼어들 수 있다
+    if (logId.isEmpty || !_receivedLogIds.add(logId)) return null;
+    if (_receivedLogIds.length > receiptDedupeSize) _receivedLogIds.remove(_receivedLogIds.first);
+    try {
+      final data = await _post('/api/v1/messages/received', {'log_id': logId, 'token': token});
+      return data['recorded'] == true;
+    } catch (e) {
+      // 4xx 는 다시 보내도 같은 답이다(없는 발송·수신자 아님) — 기억을 유지한다.
+      // 네트워크 장애·5xx·429 만 풀어 줘서 다음 배달·재시도에 다시 보고하게 한다.
+      if (e is! NotikitException || e.status >= 500 || e.status == 429) _receivedLogIds.remove(logId);
+      rethrow;
+    }
   }
 
   /// 알림 탭 처리 — `RemoteMessage.data` 를 그대로 넘기면 된다.
@@ -250,8 +295,12 @@ class Notikit {
       _reportedLogIds.remove(logId); // 토큰이 생기면 다시 시도할 수 있게 되돌린다
       return;
     }
-    // 보고 실패가 앱 흐름을 막지 않는다
-    unawaited(handleNotificationOpen(data: data, token: tok).catchError((_) => false));
+    // 보고 실패가 앱 흐름을 막지 않는다. 실패하면 기억을 되돌려 다음 탭이 다시 보고하게 한다 —
+    // 남겨 두면 오프라인에서 한 번 실패한 탭은 영영 보고되지 않는다.
+    unawaited(handleNotificationOpen(data: data, token: tok).catchError((_) {
+      _reportedLogIds.remove(logId);
+      return false;
+    }));
   }
 
   /// 푸시 페이로드에서 notikit 이 예약해 쓰는 data 키
@@ -271,7 +320,7 @@ class Notikit {
 
   /// notikit·FCM 이 쓰는 키. 이것을 뺀 나머지가 발송 때 넣은 커스텀 필드다(서버의 금지 키 목록과 같다).
   static const Set<String> _internalKeys = {
-    'deep_link', logIdKey, 'title', 'body', 'icon', 'image',
+    'deep_link', logIdKey, 'actions', 'title', 'body', 'icon', 'image',
     'aps', 'from', 'collapse_key', 'notification', 'message_type', 'fcm_options',
   };
   static const List<String> _internalPrefixes = ['google.', 'gcm.'];

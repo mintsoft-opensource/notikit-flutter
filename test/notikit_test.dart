@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -143,6 +144,112 @@ void main() {
       expect(Notikit.customDataFromPayload(payload), {'order_id': 'A-1', 'screen': 'order'});
       expect(Notikit.deepLinkFromPayload(payload), 'myapp://orders');
       expect(Notikit.customDataFromPayload(null), isEmpty);
+    });
+
+    test('customDataFromPayload skips actions', () {
+      final payload = <String, dynamic>{
+        'actions': '[{"id":"a","title":"A"}]',
+        'order_id': 'A-1',
+      };
+      expect(Notikit.customDataFromPayload(payload), {'order_id': 'A-1'});
+    });
+
+    test('failed tap report can be reported again on a later tap', () async {
+      var calls = 0;
+      final n = Notikit(
+        baseUrl: 'https://push.test',
+        apiKey: 'nk',
+        client: MockClient((req) async {
+          calls++;
+          if (calls == 1) {
+            return http.Response(jsonEncode({'success': false, 'data': null, 'error': 'down'}), 503);
+          }
+          return http.Response(jsonEncode({'success': true, 'data': {'recorded': true}, 'error': null}), 202);
+        }),
+      );
+      final taps = StreamController<Map<String, dynamic>>();
+      final sub = n.attachTapStream(onOpened: taps.stream, token: () => 't1');
+      taps.add({'notikit_log_id': 'log1'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      taps.add({'notikit_log_id': 'log1'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      taps.add({'notikit_log_id': 'log1'});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(calls, 2); // 실패 후 1회 재시도, 성공한 뒤로는 다시 보내지 않는다
+      await sub.cancel();
+      await taps.close();
+    });
+
+    group('reportReceived', () {
+      late List<http.Request> requests;
+      late List<int> statuses;
+      late Notikit n;
+      setUp(() {
+        requests = [];
+        statuses = [];
+        n = Notikit(
+          baseUrl: 'https://push.test',
+          apiKey: 'nk',
+          client: MockClient((req) async {
+            requests.add(req);
+            final status = statuses.isEmpty ? 202 : statuses.removeAt(0);
+            if (status >= 400) {
+              return http.Response(jsonEncode({'success': false, 'data': null, 'error': 'x'}), status);
+            }
+            return http.Response(jsonEncode({'success': true, 'data': {'recorded': true}, 'error': null}), status);
+          }),
+        );
+      });
+
+      test('posts log_id and token, then skips the same log', () async {
+        expect(await n.reportReceived(logId: 'log1', token: 't1'), isTrue);
+        expect(await n.reportReceived(logId: 'log1', token: 't1'), isNull);
+        expect(requests, hasLength(1));
+        expect(requests.single.url.path, '/api/v1/messages/received');
+        expect(jsonDecode(requests.single.body), {'log_id': 'log1', 'token': 't1'});
+      });
+
+      test('empty log id sends nothing', () async {
+        expect(await n.reportReceived(logId: '', token: 't1'), isNull);
+        expect(requests, isEmpty);
+      });
+
+      test('forgets the log on 5xx and 429 so it can retry', () async {
+        statuses.addAll([500, 429]);
+        await expectLater(n.reportReceived(logId: 'log1', token: 't1'), throwsA(isA<NotikitException>()));
+        await expectLater(n.reportReceived(logId: 'log1', token: 't1'), throwsA(isA<NotikitException>()));
+        expect(await n.reportReceived(logId: 'log1', token: 't1'), isTrue);
+        expect(requests, hasLength(3));
+      });
+
+      test('forgets the log on network error', () async {
+        final flaky = Notikit(
+          baseUrl: 'https://push.test',
+          apiKey: 'nk',
+          client: MockClient((req) async {
+            requests.add(req);
+            if (requests.length == 1) throw http.ClientException('offline');
+            return http.Response(jsonEncode({'success': true, 'data': {'recorded': true}, 'error': null}), 202);
+          }),
+        );
+        await expectLater(flaky.reportReceived(logId: 'log1', token: 't1'), throwsA(isA<http.ClientException>()));
+        expect(await flaky.reportReceived(logId: 'log1', token: 't1'), isTrue);
+      });
+
+      test('keeps the log on 4xx so it is not retried', () async {
+        statuses.add(404);
+        await expectLater(n.reportReceived(logId: 'log1', token: 't1'), throwsA(isA<NotikitException>()));
+        expect(await n.reportReceived(logId: 'log1', token: 't1'), isNull);
+        expect(requests, hasLength(1));
+      });
+
+      test('remembers at most 200 logs, dropping the oldest', () async {
+        for (var i = 0; i < 201; i++) {
+          await n.reportReceived(logId: 'log$i', token: 't1');
+        }
+        expect(await n.reportReceived(logId: 'log0', token: 't1'), isTrue);
+        expect(await n.reportReceived(logId: 'log200', token: 't1'), isNull);
+      });
     });
   });
 }
