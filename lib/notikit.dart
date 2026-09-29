@@ -16,6 +16,27 @@ class NotikitException implements Exception {
   String toString() => 'NotikitException($status): $message';
 }
 
+/// [Notikit.rotateToken] 이 실제로 한 일.
+enum TokenRotationOutcome {
+  /// 서버가 기존 행의 토큰을 제자리에서 바꿨다 — 기기 id·토픽 구독·클릭 이력이 그대로다.
+  rotated,
+
+  /// 서버가 교체하지 못해(`rotated: false`) 새 토큰을 [Notikit.registerDevice] 로 등록했다.
+  registered,
+
+  /// 옛 토큰과 새 토큰이 같아 아무 요청도 보내지 않았다.
+  unchanged,
+}
+
+/// [Notikit.rotateToken] 의 결과.
+///
+/// 0.1.x 는 서버 응답 `Map` 을 그대로 돌려줬다. 그 호출부(`r['rotated']`)가 깨지지 않도록
+/// 응답 Map 을 그대로 감싸고 [outcome] 만 더한다.
+class TokenRotation extends MapView<String, dynamic> {
+  final TokenRotationOutcome outcome;
+  TokenRotation(this.outcome, Map<String, dynamic> response) : super(response);
+}
+
 class Notikit {
   final String baseUrl;
 
@@ -69,7 +90,19 @@ class Notikit {
     return data is Map<String, dynamic> ? data : <String, dynamic>{};
   }
 
+  /// 마지막으로 등록에 성공한 토큰·플랫폼·유저. 토큰 교체가 서버에서 거절될 때
+  /// 새 토큰을 같은 유저로 다시 등록하려면 앱에 되묻지 않고 알고 있어야 한다.
+  ///
+  /// 프로세스 메모리에만 둔다 — 앱은 시작할 때마다 [registerDevice] 를 부르므로 그때 다시 채워진다.
+  String? _lastToken;
+  String? _lastPlatform;
+  String? _userId;
+  String? _identityHash;
+
   /// 디바이스/토큰 등록 (user id 바인딩 시 identityHash 필요)
+  ///
+  /// user id 없이 부르면 서버는 기존 바인딩을 유지한다 — 그래서 기억해 둔 유저도 지우지 않는다.
+  /// 유저를 떼려면 [unbindDevice] 를 부른다.
   Future<Map<String, dynamic>> registerDevice({
     required String token,
     required String platform,
@@ -78,9 +111,9 @@ class Notikit {
     String? identityHash,
     String? locale,
     String? timezone,
-  }) {
+  }) async {
     final uid = userId ?? externalId;
-    return _post('/api/v1/devices', {
+    final data = await _post('/api/v1/devices', {
       'token': token,
       'platform': platform,
       'user_id': uid,
@@ -88,6 +121,13 @@ class Notikit {
       'locale': locale,
       'timezone': timezone,
     });
+    _lastToken = token;
+    _lastPlatform = platform;
+    if (uid != null) {
+      _userId = uid;
+      _identityHash = identityHash;
+    }
+    return data;
   }
 
   /// 유저 식별 — userId 는 고객 서비스의 유저 id
@@ -138,25 +178,77 @@ class Notikit {
   /// 토큰을 제자리 갱신하게 해 기기 id·토픽 구독·클릭 이력을 보존한다.
   ///
   /// 서버는 교체하지 못해도(모르는 옛 토큰·identity 증명 실패·충돌) 202 `{rotated: false}` 로
-  /// 답한다. 그때 새 토큰은 어디에도 등록되지 않았으므로 **[registerDevice] 로 직접 등록**해야
-  /// 이 기기로 발송이 이어진다:
+  /// 답한다 — 오라클이 되지 않으려고 이유를 가르지 않는다. 그걸 성공으로 보면 새 토큰은
+  /// 어디에도 등록되지 않아 이 기기로 발송이 끊긴다. 그래서 마지막 [registerDevice] 의
+  /// 유저·identityHash 로(없으면 익명으로) 새 토큰을 직접 등록한다. 그것마저 실패하면 던진다.
   ///
-  /// ```dart
-  /// final r = await notikit.rotateToken(oldToken: old, newToken: fresh, identityHash: hash);
-  /// if (r['rotated'] != true) {
-  ///   await notikit.registerDevice(token: fresh, platform: platform, userId: userId, identityHash: hash);
-  /// }
-  /// ```
-  Future<Map<String, dynamic>> rotateToken({
+  /// [identityHash] 를 주지 않으면 기억해 둔 값을 쓴다. [platform] 은 재등록에만 쓰이며,
+  /// 주지 않으면 마지막 등록의 플랫폼을 쓴다 — 둘 다 없으면 재등록할 수 없어 [StateError].
+  ///
+  /// 반환값은 서버 응답 Map 이기도 해서 기존 `r['rotated']` 호출부가 그대로 동작한다.
+  Future<TokenRotation> rotateToken({
     required String oldToken,
     required String newToken,
     String? identityHash,
-  }) {
-    return _post('/api/v1/devices/rotate', {
+    String? platform,
+  }) async {
+    if (oldToken == newToken) {
+      return TokenRotation(TokenRotationOutcome.unchanged, {'rotated': false});
+    }
+    final hash = identityHash ?? _identityHash;
+    final res = await _post('/api/v1/devices/rotate', {
       'old_token': oldToken,
       'new_token': newToken,
-      'identity_hash': identityHash,
+      'identity_hash': hash,
     });
+    if (res['rotated'] == true) {
+      if (_lastToken == oldToken) _lastToken = newToken;
+      return TokenRotation(TokenRotationOutcome.rotated, res);
+    }
+
+    final plat = platform ?? _lastPlatform;
+    if (plat == null) {
+      throw StateError('rotateToken: server did not rotate and no platform is known to re-register');
+    }
+    // registerDevice 가 성공하면 _lastToken 도 새 토큰으로 옮겨진다
+    await registerDevice(token: newToken, platform: plat, userId: _userId, identityHash: hash);
+    return TokenRotation(TokenRotationOutcome.registered, res);
+  }
+
+  /// 토큰 갱신 스트림을 붙여 교체를 자동화한다.
+  ///
+  /// firebase_messaging 에 의존하지 않으려고 스트림을 **인자로 받는다**:
+  ///
+  ///     final sub = notikit.attachTokenRefresh(FirebaseMessaging.instance.onTokenRefresh);
+  ///
+  /// 옛 토큰은 마지막으로 등록(또는 교체)에 성공한 토큰이다. 아직 [registerDevice] 가
+  /// 성공한 적이 없으면 갱신을 건너뛴다 — 앱 시작 시 등록이 새 토큰을 싣고 간다.
+  ///
+  /// 갱신은 **하나씩 순서대로** 처리한다. 겹치면 두 번째 교체가 첫 교체 결과를 모른 채
+  /// 같은 옛 토큰에서 출발해 서버가 거절하고 불필요한 재등록이 나간다.
+  /// 실패는 [onError] 로만 알린다 — 토큰 갱신 실패가 앱을 죽이면 안 된다. 실패하면
+  /// 옛 토큰이 그대로 남아 다음 갱신이 거기서 다시 시도한다.
+  ///
+  /// 반환한 구독은 앱 종료 시 취소한다.
+  StreamSubscription<String> attachTokenRefresh(
+    Stream<String> onRefresh, {
+    void Function(Object error)? onError,
+  }) {
+    var chain = Future<void>.value();
+    return onRefresh.listen(
+      (fresh) {
+        chain = chain.then((_) async {
+          final old = _lastToken;
+          if (old == null) return;
+          try {
+            await rotateToken(oldToken: old, newToken: fresh);
+          } catch (e) {
+            onError?.call(e);
+          }
+        });
+      },
+      onError: (Object e) => onError?.call(e),
+    );
   }
 
   /// 디바이스 바인딩 해제 (로그아웃/계정전환).
@@ -168,6 +260,9 @@ class Notikit {
     required String platform,
     String? identityHash,
   }) {
+    // 요청 **전에** 잊는다 — 해제가 실패해도 이후 토큰 교체가 로그아웃한 유저로 재등록하면 안 된다
+    _userId = null;
+    _identityHash = null;
     return _postRaw('/api/v1/devices', {
       'token': token,
       'platform': platform,

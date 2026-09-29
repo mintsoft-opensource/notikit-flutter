@@ -251,5 +251,189 @@ void main() {
         expect(await n.reportReceived(logId: 'log200', token: 't1'), isNull);
       });
     });
+
+    group('rotateToken', () {
+      late List<http.Request> requests;
+      late bool rotated;
+      late int registerStatus;
+      late Notikit n;
+
+      http.Response ok(Map<String, dynamic> data, int status) =>
+          http.Response(jsonEncode({'success': true, 'data': data, 'error': null}), status);
+
+      List<String> paths() => requests.map((r) => r.url.path).toList();
+      Map<String, dynamic> bodyOf(http.Request r) => jsonDecode(r.body) as Map<String, dynamic>;
+
+      setUp(() {
+        requests = [];
+        rotated = true;
+        registerStatus = 201;
+        n = Notikit(
+          baseUrl: 'https://push.test',
+          apiKey: 'nk',
+          client: MockClient((req) async {
+            requests.add(req);
+            if (req.url.path == '/api/v1/devices/rotate') return ok({'rotated': rotated}, 202);
+            if (registerStatus >= 400) {
+              return http.Response(jsonEncode({'success': false, 'data': null, 'error': 'x'}), registerStatus);
+            }
+            return ok({'device': {}}, registerStatus);
+          }),
+        );
+      });
+
+      test('same token does nothing', () async {
+        final r = await n.rotateToken(oldToken: 't1', newToken: 't1');
+        expect(r.outcome, TokenRotationOutcome.unchanged);
+        expect(requests, isEmpty);
+      });
+
+      test('rotated in place does not re-register', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        requests.clear();
+        final r = await n.rotateToken(oldToken: 't1', newToken: 't2');
+        expect(r.outcome, TokenRotationOutcome.rotated);
+        expect(r['rotated'], isTrue);
+        expect(paths(), ['/api/v1/devices/rotate']);
+        expect(bodyOf(requests.single), {'old_token': 't1', 'new_token': 't2', 'identity_hash': 'h'});
+      });
+
+      test('rotated:false re-registers the new token with the remembered user', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        requests.clear();
+        rotated = false;
+        final r = await n.rotateToken(oldToken: 't1', newToken: 't2');
+        expect(r.outcome, TokenRotationOutcome.registered);
+        expect(r['rotated'], isFalse);
+        expect(paths(), ['/api/v1/devices/rotate', '/api/v1/devices']);
+        expect(bodyOf(requests[1]), {'token': 't2', 'platform': 'ios', 'user_id': 'u1', 'identity_hash': 'h'});
+      });
+
+      test('rotated:false with no remembered user registers anonymously', () async {
+        rotated = false;
+        final r = await n.rotateToken(oldToken: 't1', newToken: 't2', platform: 'android');
+        expect(r.outcome, TokenRotationOutcome.registered);
+        expect(bodyOf(requests[1]), {'token': 't2', 'platform': 'android'});
+      });
+
+      test('rotated:false without a known platform throws StateError', () async {
+        rotated = false;
+        await expectLater(n.rotateToken(oldToken: 't1', newToken: 't2'), throwsStateError);
+      });
+
+      test('throws when the fallback registration also fails', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        rotated = false;
+        registerStatus = 403;
+        await expectLater(n.rotateToken(oldToken: 't1', newToken: 't2'), throwsA(isA<NotikitException>()));
+      });
+
+      test('unbindDevice forgets the user so the fallback is anonymous', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        await n.unbindDevice(token: 't1', platform: 'ios', identityHash: 'h');
+        requests.clear();
+        rotated = false;
+        await n.rotateToken(oldToken: 't1', newToken: 't2');
+        expect(bodyOf(requests.first).containsKey('identity_hash'), isFalse);
+        expect(bodyOf(requests[1]), {'token': 't2', 'platform': 'ios'});
+      });
+
+      test('registering without a user keeps the remembered user', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        await n.registerDevice(token: 't1', platform: 'ios');
+        requests.clear();
+        rotated = false;
+        await n.rotateToken(oldToken: 't1', newToken: 't2');
+        expect(bodyOf(requests[1])['user_id'], 'u1');
+      });
+
+      test('explicit identityHash wins over the remembered one', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        requests.clear();
+        await n.rotateToken(oldToken: 't1', newToken: 't2', identityHash: 'h2');
+        expect(bodyOf(requests.single)['identity_hash'], 'h2');
+      });
+
+      test('result is still a Map for existing callers', () async {
+        final Map<String, dynamic> r = await n.rotateToken(oldToken: 't1', newToken: 't2');
+        expect(r['rotated'], isTrue);
+      });
+    });
+
+    group('attachTokenRefresh', () {
+      late List<http.Request> requests;
+      late bool rotated;
+      late Notikit n;
+
+      setUp(() {
+        requests = [];
+        rotated = true;
+        n = Notikit(
+          baseUrl: 'https://push.test',
+          apiKey: 'nk',
+          client: MockClient((req) async {
+            requests.add(req);
+            final data = req.url.path == '/api/v1/devices/rotate' ? {'rotated': rotated} : {'device': {}};
+            return http.Response(jsonEncode({'success': true, 'data': data, 'error': null}), 202);
+          }),
+        );
+      });
+
+      test('rotates from the last registered token, chaining successive refreshes', () async {
+        await n.registerDevice(token: 't1', platform: 'ios', userId: 'u1', identityHash: 'h');
+        requests.clear();
+        final refresh = StreamController<String>();
+        final sub = n.attachTokenRefresh(refresh.stream);
+        refresh.add('t2');
+        refresh.add('t3');
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        final bodies = requests.map((r) => jsonDecode(r.body) as Map<String, dynamic>).toList();
+        expect(bodies.map((b) => [b['old_token'], b['new_token']]).toList(), [
+          ['t1', 't2'],
+          ['t2', 't3'],
+        ]);
+        await sub.cancel();
+        await refresh.close();
+      });
+
+      test('ignores refreshes before any registration', () async {
+        final refresh = StreamController<String>();
+        final sub = n.attachTokenRefresh(refresh.stream);
+        refresh.add('t2');
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(requests, isEmpty);
+        await sub.cancel();
+        await refresh.close();
+      });
+
+      test('reports failures to onError and keeps the old token for the next try', () async {
+        final errors = <Object>[];
+        final failing = Notikit(
+          baseUrl: 'https://push.test',
+          apiKey: 'nk',
+          client: MockClient((req) async {
+            requests.add(req);
+            if (req.url.path == '/api/v1/devices/rotate' && requests.length == 1) {
+              throw http.ClientException('offline');
+            }
+            final data = req.url.path == '/api/v1/devices/rotate' ? {'rotated': true} : {'device': {}};
+            return http.Response(jsonEncode({'success': true, 'data': data, 'error': null}), 202);
+          }),
+        );
+        await failing.registerDevice(token: 't1', platform: 'ios');
+        requests.clear();
+        final refresh = StreamController<String>();
+        final sub = failing.attachTokenRefresh(refresh.stream, onError: errors.add);
+        refresh.add('t2');
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(errors.single, isA<http.ClientException>());
+        refresh.add('t3');
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        final last = jsonDecode(requests.last.body) as Map<String, dynamic>;
+        expect([last['old_token'], last['new_token']], ['t1', 't3']);
+        await sub.cancel();
+        await refresh.close();
+      });
+    });
   });
 }

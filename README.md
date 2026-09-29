@@ -7,7 +7,7 @@
 ## 설치
 ```yaml
 dependencies:
-  notikit: ^0.1.0
+  notikit: ^0.2.0
   firebase_messaging: ^15.0.0
 ```
 
@@ -62,6 +62,36 @@ Future<void> onBackground(RemoteMessage m) async {
 FirebaseMessaging.onBackgroundMessage(onBackground);
 ```
 
+### 토큰 교체
+FCM 토큰은 언제든 바뀐다. 새 토큰으로 `registerDevice` 를 다시 부르면 행이 하나 더 생겨
+같은 사람에게 중복 발송되므로, 갱신 스트림을 한 번만 붙인다:
+
+```dart
+final sub = notikit.attachTokenRefresh(
+  FirebaseMessaging.instance.onTokenRefresh,
+  onError: (e) => debugPrint('notikit token rotation failed: $e'),
+);
+```
+
+SDK 는 마지막으로 등록에 성공한 토큰에서 새 토큰으로 `rotateToken` 을 부른다. 서버가 교체하지
+못하면(`rotated: false` — 모르는 옛 토큰·identity 증명 실패·충돌) 마지막 `registerDevice` 의
+`userId`·`identityHash` 로(없으면 익명으로) 새 토큰을 **자동 재등록**한다. 로그아웃
+(`unbindDevice`) 뒤에는 유저를 잊으므로 익명으로 재등록된다. 기억은 프로세스 메모리에만 있으니
+앱 시작 시 `registerDevice` 는 계속 부른다.
+
+직접 부를 때는 결과로 무슨 일이 있었는지 알 수 있다:
+
+```dart
+final r = await notikit.rotateToken(oldToken: old, newToken: fresh);
+switch (r.outcome) {
+  case TokenRotationOutcome.rotated: // 제자리 교체 — 기기 id·구독·이력 유지
+  case TokenRotationOutcome.registered: // 교체 거절 → 새 토큰으로 재등록
+  case TokenRotationOutcome.unchanged: // 같은 토큰 — 요청 없음
+}
+```
+
+재등록마저 실패하면 예외를 던진다. `r['rotated']` 처럼 응답 Map 으로 읽던 0.1.x 코드도 그대로 동작한다.
+
 ## API
 | | 설명 |
 |---|---|
@@ -69,6 +99,9 @@ FirebaseMessaging.onBackgroundMessage(onBackground);
 | `identify(userId: ...)` | 유저 식별 |
 | `subscribe(topic, token)` | 토픽 구독 |
 | `unsubscribe(topic, token)` | 토픽 구독 해지 |
+| `rotateToken(oldToken: ..., newToken: ...)` | 토큰 교체. 서버가 거절하면 새 토큰을 자동 재등록 |
+| `attachTokenRefresh(onTokenRefresh)` | 토큰 갱신 스트림을 붙여 교체 자동화 |
+| `unbindDevice(token: ..., platform: ...)` | 로그아웃 — 유저 바인딩 해제 |
 | `reportReceived(logId: ..., token: ...)` | 수신(도달) 보고. 이미 보고한 발송이면 요청 없이 `null` |
 | `Notikit.customDataFromPayload(message.data)` | 받은 푸시에서 커스텀 필드(템플릿 필드 포함)만 꺼내기 |
 | `Notikit.deepLinkFromPayload(message.data)` | 받은 푸시의 딥링크 |
